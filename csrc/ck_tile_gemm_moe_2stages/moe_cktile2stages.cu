@@ -385,6 +385,92 @@ torch::Tensor cktile_moe_gemm1(torch::Tensor& XQ,
     return Y;
 }
 
+
+// Direct dispatch for gather-reduce path (ForceSetOutput=true)
+// Bypasses heuristic dispatch, uses a fixed tile config per block_m
+template <typename ADataType, typename BDataType, typename AccDataType, typename CDataType>
+static void moe_gemm2_gather_reduce(
+    torch::Tensor& XQ,
+    torch::Tensor& WQ,
+    torch::Tensor& Y,
+    torch::Tensor& sorted_ids,
+    torch::Tensor& sorted_expert_ids,
+    torch::Tensor& max_token_ids,
+    int topk,
+    std::optional<int> n_padded_zeros,
+    std::optional<int> k_padded_zeros,
+    std::optional<torch::Tensor> x_scale,
+    std::optional<torch::Tensor> w_scale,
+    std::optional<torch::Tensor> exp_bias,
+    int act_op,
+    int k_batch,
+    int block_m)
+{
+    int NumTokens = XQ.size(0);
+    int M         = sorted_ids.size(0);
+    int N         = WQ.size(1);
+    int K         = XQ.size(-1);
+    int E         = WQ.size(0);
+    int KBatch    = k_batch;
+    int stride_A  = K;
+    int stride_B  = K;
+    int stride_C  = N;  // stage2: no gate+up division
+
+    // No sorted_weights for gather-reduce (ForceSetOutput skips weight multiplication)
+    void* sorted_weights_ptr = nullptr;
+
+    auto per_a_scale_dev_ptr = ck_tile::FlatmmScalePointer<-1>{nullptr};
+    auto per_b_scale_dev_ptr = ck_tile::FlatmmScalePointer<-1>{nullptr};
+    auto exp_bias_dev_ptr    = ck_tile::FlatmmScalePointer<-1>{nullptr};
+
+    // Build kernel args
+    ck_tile::MoeFlatmmHostArgs<decltype(per_a_scale_dev_ptr),
+                               decltype(per_b_scale_dev_ptr),
+                               decltype(exp_bias_dev_ptr)> kernel_args{
+        reinterpret_cast<const ck_tile::index_t*>(sorted_ids.data_ptr()),
+        sorted_weights_ptr,
+        reinterpret_cast<const ck_tile::index_t*>(sorted_expert_ids.data_ptr()),
+        reinterpret_cast<const ck_tile::index_t*>(max_token_ids.data_ptr()),
+        reinterpret_cast<const void*>(XQ.data_ptr()),
+        reinterpret_cast<const void*>(WQ.data_ptr()),
+        reinterpret_cast<void*>(Y.data_ptr()),
+        NumTokens, E, topk, KBatch,
+        M, N, K,
+        stride_A, stride_B, stride_C,
+        n_padded_zeros.has_value() ? n_padded_zeros.value() : 0,
+        k_padded_zeros.has_value() ? k_padded_zeros.value() : 0,
+        per_a_scale_dev_ptr,
+        per_b_scale_dev_ptr,
+        exp_bias_dev_ptr
+    };
+
+    auto stream_config = ck_stream_config{at::hip::getCurrentHIPStreamMasqueradingAsCUDA().stream()};
+
+    // Use fixed tile config for stage2 gather-reduce
+    // WAVE_TILE_K differs by ADataType: 32 for bf16, 128 for fp8
+    constexpr int WaveTileK = (sizeof(ADataType) == 1) ? 128 : 32;
+    if(block_m <= 32)
+    {
+        using TileConfig = MoeFlatmmConfig<ADataType, 32, 256, 256, 1, 4, 16, 16, WaveTileK, 2>;
+        moe_gemm<TileConfig,
+                 ADataType, BDataType,
+                 ck_tile::tuple<>, AccDataType, CDataType,
+                 row_major, col_major, ck_tile::tuple<>, row_major,
+                 ck_tile::MoeFlatmmKind::kFFN_gemm2,
+                 ck_tile::element_wise::PassThrough, -1, true>(kernel_args, stream_config);
+    }
+    else
+    {
+        using TileConfig = MoeFlatmmConfig<ADataType, 64, 256, 256, 1, 4, 16, 16, WaveTileK, 1>;
+        moe_gemm<TileConfig,
+                 ADataType, BDataType,
+                 ck_tile::tuple<>, AccDataType, CDataType,
+                 row_major, col_major, ck_tile::tuple<>, row_major,
+                 ck_tile::MoeFlatmmKind::kFFN_gemm2,
+                 ck_tile::element_wise::PassThrough, -1, true>(kernel_args, stream_config);
+    }
+}
+
 torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                torch::Tensor& WQ,
                                torch::Tensor& Y,
@@ -401,7 +487,8 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
                                std::optional<int> activation,
                                std::optional<int> block_m,
                                std::optional<int> split_k,
-                               std::string kernel_name)
+                               std::string kernel_name,
+                               bool use_gather_reduce)
 {
     TORCH_CHECK(Y.dtype() == at::ScalarType::BFloat16 || Y.dtype() == at::ScalarType::Half,
                 "Out dtype only support BFloat16/Float16!");
@@ -421,6 +508,32 @@ torch::Tensor cktile_moe_gemm2(torch::Tensor& XQ,
     int k_batch   = split_k.has_value() ? split_k.value() : 1;
 
     const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(Y));
+
+    // Gather-reduce path: ForceSetOutput=true, no weight multiplication
+    if(use_gather_reduce)
+    {
+        if((XQ.dtype() == at::ScalarType::BFloat16 || XQ.dtype() == at::ScalarType::Half) &&
+           (WQ.dtype() == torch_fp4x2) && Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_gemm2_gather_reduce<bf16, pk_fp4, float, bf16>(
+                XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids,
+                topk, n_padded_zeros, k_padded_zeros,
+                x_scale, w_scale, exp_bias, act_op, k_batch, MPerBlock);
+        }
+        else if(XQ.dtype() == torch_fp8 && WQ.dtype() == torch_fp4x2 &&
+                Y.dtype() == at::ScalarType::BFloat16)
+        {
+            moe_gemm2_gather_reduce<fp8, pk_fp4, float, bf16>(
+                XQ, WQ, Y, sorted_ids, sorted_expert_ids, max_token_ids,
+                topk, n_padded_zeros, k_padded_zeros,
+                x_scale, w_scale, exp_bias, act_op, k_batch, MPerBlock);
+        }
+        else
+        {
+            TORCH_CHECK(false, "gather_reduce: unsupported dtype combination");
+        }
+        return Y;
+    }
 
     // Name-based dispatch: look up kernel by name directly
     if(!kernel_name.empty())

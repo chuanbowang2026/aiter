@@ -36,6 +36,181 @@
 namespace vllm {
 namespace moe {
 
+// ====================== Bitonic sorting network helpers =======================
+// SonicMoE-style bitonic top-K with index packing.
+// Index is encoded in FP32 mantissa low bits so compare-and-swap moves both
+// value and index simultaneously — no separate index array needed.
+
+__device__ __forceinline__ void bitonic_cas_desc(float& a, float& b)
+{
+    float lo = fminf(a, b);
+    float hi = fmaxf(a, b);
+    a = hi;
+    b = lo;
+}
+
+// Optimal sorting networks (descending) for small N.
+// Generated from https://bertdobbelaere.github.io/sorting_networks.html
+template <int N>
+__device__ __forceinline__ void bitonic_sort_desc(float* v)
+{
+    if constexpr(N <= 1) return;
+    else if constexpr(N == 2)
+    {
+        bitonic_cas_desc(v[0], v[1]);
+    }
+    else if constexpr(N == 4)
+    {
+        bitonic_cas_desc(v[0], v[2]); bitonic_cas_desc(v[1], v[3]);
+        bitonic_cas_desc(v[0], v[1]); bitonic_cas_desc(v[2], v[3]);
+        bitonic_cas_desc(v[1], v[2]);
+    }
+    else if constexpr(N == 8)
+    {
+        bitonic_cas_desc(v[0], v[2]); bitonic_cas_desc(v[1], v[3]);
+        bitonic_cas_desc(v[4], v[6]); bitonic_cas_desc(v[5], v[7]);
+        bitonic_cas_desc(v[0], v[4]); bitonic_cas_desc(v[1], v[5]);
+        bitonic_cas_desc(v[2], v[6]); bitonic_cas_desc(v[3], v[7]);
+        bitonic_cas_desc(v[0], v[1]); bitonic_cas_desc(v[2], v[3]);
+        bitonic_cas_desc(v[4], v[5]); bitonic_cas_desc(v[6], v[7]);
+        bitonic_cas_desc(v[2], v[4]); bitonic_cas_desc(v[3], v[5]);
+        bitonic_cas_desc(v[1], v[4]); bitonic_cas_desc(v[3], v[6]);
+        bitonic_cas_desc(v[1], v[2]); bitonic_cas_desc(v[3], v[4]);
+        bitonic_cas_desc(v[5], v[6]);
+    }
+    else if constexpr(N == 16)
+    {
+        bitonic_cas_desc(v[0], v[13]); bitonic_cas_desc(v[1], v[12]);
+        bitonic_cas_desc(v[2], v[15]); bitonic_cas_desc(v[3], v[14]);
+        bitonic_cas_desc(v[4], v[8]);  bitonic_cas_desc(v[5], v[6]);
+        bitonic_cas_desc(v[7], v[11]); bitonic_cas_desc(v[9], v[10]);
+
+        bitonic_cas_desc(v[0], v[5]);  bitonic_cas_desc(v[1], v[7]);
+        bitonic_cas_desc(v[2], v[9]);  bitonic_cas_desc(v[3], v[4]);
+        bitonic_cas_desc(v[6], v[13]); bitonic_cas_desc(v[8], v[14]);
+        bitonic_cas_desc(v[10], v[15]); bitonic_cas_desc(v[11], v[12]);
+
+        bitonic_cas_desc(v[0], v[1]);  bitonic_cas_desc(v[2], v[3]);
+        bitonic_cas_desc(v[4], v[5]);  bitonic_cas_desc(v[6], v[8]);
+        bitonic_cas_desc(v[7], v[9]);  bitonic_cas_desc(v[10], v[11]);
+        bitonic_cas_desc(v[12], v[13]); bitonic_cas_desc(v[14], v[15]);
+
+        bitonic_cas_desc(v[0], v[2]);  bitonic_cas_desc(v[1], v[3]);
+        bitonic_cas_desc(v[4], v[10]); bitonic_cas_desc(v[5], v[11]);
+        bitonic_cas_desc(v[6], v[7]);  bitonic_cas_desc(v[8], v[9]);
+        bitonic_cas_desc(v[12], v[14]); bitonic_cas_desc(v[13], v[15]);
+
+        bitonic_cas_desc(v[1], v[2]);  bitonic_cas_desc(v[3], v[12]);
+        bitonic_cas_desc(v[4], v[6]);  bitonic_cas_desc(v[5], v[7]);
+        bitonic_cas_desc(v[8], v[10]); bitonic_cas_desc(v[9], v[11]);
+        bitonic_cas_desc(v[13], v[14]);
+
+        bitonic_cas_desc(v[1], v[4]);  bitonic_cas_desc(v[2], v[6]);
+        bitonic_cas_desc(v[5], v[8]);  bitonic_cas_desc(v[7], v[10]);
+        bitonic_cas_desc(v[9], v[13]); bitonic_cas_desc(v[11], v[14]);
+
+        bitonic_cas_desc(v[2], v[4]);  bitonic_cas_desc(v[3], v[6]);
+        bitonic_cas_desc(v[9], v[12]); bitonic_cas_desc(v[11], v[13]);
+
+        bitonic_cas_desc(v[3], v[5]);  bitonic_cas_desc(v[6], v[8]);
+        bitonic_cas_desc(v[7], v[9]);  bitonic_cas_desc(v[10], v[12]);
+
+        bitonic_cas_desc(v[3], v[4]);  bitonic_cas_desc(v[5], v[6]);
+        bitonic_cas_desc(v[7], v[8]);  bitonic_cas_desc(v[9], v[10]);
+        bitonic_cas_desc(v[11], v[12]);
+
+        bitonic_cas_desc(v[6], v[7]);  bitonic_cas_desc(v[8], v[9]);
+    }
+    else
+    {
+        // Generic bitonic sort for larger N (must be power of 2)
+        // Build bitonic sequence bottom-up, then merge
+#pragma unroll
+        for(int size = 2; size <= N; size <<= 1)
+        {
+#pragma unroll
+            for(int stride = size >> 1; stride > 0; stride >>= 1)
+            {
+#pragma unroll
+                for(int i = 0; i < N; i++)
+                {
+                    int j = i ^ stride;
+                    if(j > i)
+                    {
+                        bool asc = ((i & size) == 0);
+                        if(asc)
+                            bitonic_cas_desc(v[i], v[j]);
+                        else
+                        {
+                            float lo = fminf(v[i], v[j]);
+                            float hi = fmaxf(v[i], v[j]);
+                            v[i] = lo;
+                            v[j] = hi;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Bitonic merge: merge sorted arr[0..N-1] (descending) into sorted output.
+template <int N>
+__device__ __forceinline__ void bitonic_merge_desc(float* arr)
+{
+    if constexpr(N > 1)
+    {
+        static_assert((N & (N - 1)) == 0, "N must be power of 2");
+#pragma unroll
+        for(int stride = N >> 1; stride > 0; stride >>= 1)
+        {
+#pragma unroll
+            for(int i = 0; i < N; i++)
+            {
+                int j = i ^ stride;
+                if(j > i)
+                    bitonic_cas_desc(arr[i], arr[j]);
+            }
+        }
+    }
+}
+
+// Merge two sorted (descending) sequences of length K, keep top-K in `topk`.
+template <int K>
+__device__ __forceinline__ void bitonic_topk_merge_desc(float* topk, const float* other)
+{
+    // Compare topk[i] with other[K-1-i] and keep the larger ones
+#pragma unroll
+    for(int i = 0; i < K; i++)
+        topk[i] = fmaxf(topk[i], other[K - 1 - i]);
+    // Now topk is bitonic — merge it back to sorted descending
+    bitonic_merge_desc<K>(topk);
+}
+
+// Constexpr next power of 2 for compile-time constants
+template <int N>
+struct NextPow2
+{
+    static constexpr int value = (N <= 1) ? 1 : (1 << (32 - __builtin_clz(N - 1)));
+};
+
+// Constexpr log2 for powers of 2
+template <int N>
+struct Log2
+{
+    static constexpr int value = 1 + Log2<N / 2>::value;
+};
+template <>
+struct Log2<1>
+{
+    static constexpr int value = 0;
+};
+template <>
+struct Log2<0>
+{
+    static constexpr int value = 0;
+};
+
 // Enum for shared expert scoring functions
 enum class SharedExpertScoringFunc
 {
@@ -353,143 +528,140 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
         }
     }
 
-    // First, do an in-thread max reduction to get the max value and its index.
-    float thread_max      = row_chunk[0];
-    int first_topk_expert = first_elt_read_by_thread;
+    // ==================== Row-max for softmax denominator ====================
+    float thread_max = row_chunk[0];
 #pragma unroll
     for(int ii = 1; ii < VPT; ++ii)
+        thread_max = fmaxf(thread_max, row_chunk[ii]);
+    thread_max = multithread_reduce(
+        thread_max, [](float a, float b) { return fmaxf(a, b); }, THREADS_PER_ROW);
+
+    // ==================== Index packing (SonicMoE-style) ====================
+    // Encode column indices into the low bits of FP32 mantissa.
+    // For positive values, invert the index bits so smaller indices win ties.
+    static constexpr int LOG_N    = Log2<NUM_EXPERTS>::value;
+    static constexpr uint32_t IDX_MASK = (1u << LOG_N) - 1;
+
+#pragma unroll
+    for(int ii = 0; ii < VPT; ++ii)
     {
-        if(thread_max < row_chunk[ii])
+        uint32_t col_idx = static_cast<uint32_t>(first_elt_read_by_thread +
+                           (ii / ELTS_PER_LDG) * ELTS_PER_LDG * THREADS_PER_ROW +
+                           (ii % ELTS_PER_LDG));
+        uint32_t encoded = (row_chunk[ii] >= 0.0f) ? (~col_idx & IDX_MASK)
+                                                    : (col_idx & IDX_MASK);
+        uint32_t bits = __builtin_bit_cast(uint32_t, row_chunk[ii]);
+        uint32_t packed = (bits & ~IDX_MASK) | encoded;
+        row_chunk[ii] = __builtin_bit_cast(float, packed);
+    }
+
+    // ==================== Bitonic top-K ====================
+    // Step 1: sort each thread's VPT elements descending (in-register)
+    bitonic_sort_desc<VPT>(row_chunk);
+
+    // Step 2: extract top-K from each thread's sorted partition
+    // K_SORT is the next power-of-2 >= k, needed for bitonic merge.
+    // Max supported k is 16 (covering all practical MoE topk values).
+    // We use constexpr K_SORT for the merge width; unused slots filled with -inf.
+    static constexpr int MAX_TOPK = 16;
+    float topk_buf[MAX_TOPK];
+#pragma unroll
+    for(int i = 0; i < MAX_TOPK; ++i)
+        topk_buf[i] = (i < VPT) ? row_chunk[i] : -INFINITY;
+
+    // Step 3: cross-thread bitonic merge via warp shuffle (butterfly pattern)
+    // Each round: exchange top-K with partner lane, merge, keep top-K.
+    if constexpr(THREADS_PER_ROW >= 2)
+    {
+#pragma unroll
+        for(int step = 1; step < THREADS_PER_ROW; step <<= 1)
         {
-            thread_max        = row_chunk[ii];
-            first_topk_expert = first_elt_read_by_thread + ii;
+            int partner = static_cast<int>(threadIdx.x) ^ step;
+            float other[MAX_TOPK];
+#pragma unroll
+            for(int i = 0; i < MAX_TOPK; ++i)
+            {
+                int32_t bits = __builtin_bit_cast(int32_t, topk_buf[i]);
+                bits = __builtin_amdgcn_ds_bpermute(partner << 2, bits);
+                other[i] = __builtin_bit_cast(float, bits);
+            }
+
+            // Merge: compare topk[i] with other[K-1-i], keep larger, then merge
+#pragma unroll
+            for(int i = 0; i < MAX_TOPK; ++i)
+                topk_buf[i] = fmaxf(topk_buf[i], other[MAX_TOPK - 1 - i]);
+            bitonic_merge_desc<MAX_TOPK>(topk_buf);
         }
     }
 
-    // Now, we find the max within the thread group and distribute among the threads.
-    auto arg_max = [](const kvp& a, const kvp& b) {
-        if(a.value > b.value || (a.value == b.value && a.key < b.key))
-        {
-            return a;
-        }
-        return b;
-    };
-    kvp thread_kvp    = {first_topk_expert, thread_max};
-    thread_kvp        = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
-    thread_max        = thread_kvp.value;
-    first_topk_expert = thread_kvp.key;
-
-    // From this point, thread max in all the threads have the max within the row.
-    // Next: select top-K and compute softmax only on them; if need_renorm=false, normalize by the
-    // full row.
-    int start_col                           = first_elt_read_by_thread;
-    static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
-
-    float renorm_value = 0.0f;
-    for(int k_idx = 0; k_idx < k; ++k_idx)
+    // ==================== Unpack + softmax + output ====================
+    if(thread_group_idx == 0)
     {
-        float max_val;
-        int expert;
-        if(k_idx == 0)
+        float renorm_value = 0.0f;
+        for(int k_idx = 0; k_idx < k; ++k_idx)
         {
-            max_val = thread_max;
-            expert  = first_topk_expert;
-        }
-        else
-        {
-            // First, each thread does the local argmax
-            max_val = row_chunk[0];
-            expert  = start_col;
-#pragma unroll
-            for(int ldg = 0, col = start_col; ldg < LDG_PER_THREAD;
-                ++ldg, col += COLS_PER_GROUP_LDG)
-            {
-#pragma unroll
-                for(int ii = 0; ii < ELTS_PER_LDG; ++ii)
-                {
-                    float val = row_chunk[ldg * ELTS_PER_LDG + ii];
+            // Unpack: extract index from low bits, clean value
+            uint32_t bits    = __builtin_bit_cast(uint32_t, topk_buf[k_idx]);
+            uint32_t encoded = bits & IDX_MASK;
+            uint32_t clean_bits = bits & ~IDX_MASK;
+            float clean_val  = __builtin_bit_cast(float, clean_bits);
+            int expert       = static_cast<int>(
+                (clean_val >= 0.0f) ? (~encoded & IDX_MASK) : (encoded & IDX_MASK));
 
-                    // No check on the experts here since columns with the smallest index are
-                    // processed first and only updated if > (not >=)
-                    if(val > max_val)
-                    {
-                        max_val = val;
-                        expert  = col + ii;
-                    }
-                }
-            }
-
-            // Now, we perform the argmax reduce.
-            kvp thread_kvp = {expert, max_val};
-            thread_kvp     = multithread_reduce(thread_kvp, arg_max, THREADS_PER_ROW);
-            max_val        = thread_kvp.value;
-            expert         = thread_kvp.key;
-        }
-        // Write the max for this k iteration to global memory.
-        if(thread_group_idx == 0)
-        {
             // Add a guard to ignore experts not included by this node
             const bool node_uses_expert   = expert >= start_expert && expert < end_expert;
             const bool should_process_row = row_is_active && node_uses_expert;
 
-            // The lead thread from each sub-group will write out the final results to global
-            // memory. (This will be a single) thread per row of the input/output matrices.
             const int output_idx  = output_stride * thread_row + k_idx;
             const int indices_idx = indices_stride * thread_row + k_idx;
             const int idx         = k * thread_row + k_idx;
-            const float numer     = expf(max_val - thread_max);
+            const float numer     = expf(clean_val - thread_max);
             output[output_idx]    = numer;
             indices[indices_idx]  = should_process_row ? (expert - start_expert) : NUM_EXPERTS;
             source_rows[idx]      = k_idx * num_rows + thread_row;
 
-            // Accumulate renorm scalar
             renorm_value += numer;
         }
 
-        // Finally, we clear the value in the thread with the current max
+        if constexpr(need_renorm)
         {
-            const int ldg_group_for_expert     = expert / COLS_PER_GROUP_LDG;
-            const int thread_to_clear_in_group = (expert / ELTS_PER_LDG) % THREADS_PER_ROW;
-
-            // Only the thread in the group which produced the max will reset the "winning" value to
-            // -inf.
-            if(thread_group_idx == thread_to_clear_in_group)
+            if(renorm_value != 0.f)
             {
-                const int offset_for_expert = expert % ELTS_PER_LDG;
-                row_chunk[ldg_group_for_expert * ELTS_PER_LDG + offset_for_expert] = -INFINITY;
+                const float inv = 1.f / renorm_value;
+                for(int k_idx = 0; k_idx < k; k_idx++)
+                {
+                    const int out_idx = output_stride * thread_row + k_idx;
+                    output[out_idx] *= inv;
+                }
             }
         }
     }
 
-    if constexpr(need_renorm)
+    // Full-row normalization (need_renorm=false): sum remaining exp(val - max)
+    if constexpr(!need_renorm)
     {
-        if(thread_group_idx == 0 && renorm_value != 0.f)
-        {
-            renorm_value = 1 / renorm_value;
-            for(int k_idx = 0; k_idx < k; k_idx++)
-            {
-                int64_t const idx = output_stride * thread_row + k_idx;
-                output[idx] *= renorm_value;
-            }
-        }
-    }
-    else
-    {
-        float thread_sum_rest = 0.f;
+        // Unpack row_chunk to get clean values for sum computation
+        // (row_chunk was sorted and packed, but we need the original values for the sum)
+        // Re-load from global memory for the sum of non-top-K elements.
+        // This is only needed for the !need_renorm path which computes full softmax.
+        float thread_sum = 0.f;
+        const AccessType* vec_reload_ptr = reinterpret_cast<const AccessType*>(thread_read_ptr);
 #pragma unroll
-        for(int ii = 0; ii < VPT; ++ii)
+        for(int ii = 0; ii < LDG_PER_THREAD; ++ii)
         {
-            thread_sum_rest += expf(row_chunk[ii] - thread_max);
+            AccessType vec = vec_reload_ptr[ii * THREADS_PER_ROW];
+#pragma unroll
+            for(int jj = 0; jj < ELTS_PER_LDG; ++jj)
+                thread_sum += expf(static_cast<float>(vec[jj]) - thread_max);
         }
-        float row_sum_rest = multithread_reduce(
-            thread_sum_rest, [](float a, float b) { return a + b; }, THREADS_PER_ROW);
+        float row_sum = multithread_reduce(
+            thread_sum, [](float a, float b) { return a + b; }, THREADS_PER_ROW);
 
         if(thread_group_idx == 0)
         {
-            const float Z = renorm_value + row_sum_rest;
-            if(Z != 0.f)
+            if(row_sum != 0.f)
             {
-                const float scale = 1.f / Z;
+                const float scale = 1.f / row_sum;
                 for(int k_idx = 0; k_idx < k; ++k_idx)
                 {
                     const int out_idx = output_stride * thread_row + k_idx;

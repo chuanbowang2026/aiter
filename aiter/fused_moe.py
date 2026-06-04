@@ -32,6 +32,7 @@ _USE_CK_MOE_SORTING = os.environ.get("AITER_USE_CK_MOE_SORTING", "0") == "1"
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
+_USE_GATHER_REDUCE = os.environ.get("AITER_USE_GATHER_REDUCE", "0") == "1"
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
@@ -67,6 +68,107 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
+def token_rounding_routing(
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    topk_ids,
+    topk_weights,
+    num_experts,
+    block_size_M,
+    topk,
+):
+    """Apply token rounding to eliminate tile quantization waste in Grouped GEMM.
+
+    Based on SonicMoE paper Section 5, Algorithm 4. For each expert, rounds the
+    token count to the nearest multiple of block_size_M instead of always rounding
+    up. This eliminates partial tiles at the cost of dropping a few tokens from
+    experts that round down.
+
+    Only beneficial during prefill with sparse MoE (large E, small K/E).
+    """
+    device = sorted_ids.device
+    M = topk_ids.shape[0]
+    num_total_topk = M * topk
+
+    expert_counts = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    flat_topk_ids = topk_ids.view(-1)
+    for e in range(num_experts):
+        expert_counts[e] = (flat_topk_ids == e).sum()
+
+    rounded_counts = torch.zeros_like(expert_counts)
+    for e in range(num_experts):
+        f_e = expert_counts[e].item()
+        if f_e == 0:
+            continue
+        ceil_f = ((f_e + block_size_M - 1) // block_size_M) * block_size_M
+        floor_f = (f_e // block_size_M) * block_size_M
+        if floor_f == 0:
+            rounded_counts[e] = ceil_f
+        elif (ceil_f - f_e) <= (f_e - floor_f):
+            rounded_counts[e] = ceil_f
+        else:
+            rounded_counts[e] = floor_f
+
+    if (rounded_counts == ((expert_counts + block_size_M - 1) // block_size_M * block_size_M)).all():
+        return sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
+
+    new_total_padded = rounded_counts.sum().item()
+    new_num_blocks = (rounded_counts // block_size_M).sum().item()
+
+    new_sorted_ids = torch.full((new_total_padded,), M, dtype=torch.int32, device=device)
+    new_sorted_weights = torch.zeros(new_total_padded, dtype=torch.float32, device=device)
+    new_sorted_expert_ids = torch.empty(new_num_blocks, dtype=torch.int32, device=device)
+
+    topk_scores_flat = topk_weights.view(-1).float()
+
+    write_offset = 0
+    block_idx = 0
+    read_offset = 0
+
+    for e in range(num_experts):
+        f_e = expert_counts[e].item()
+        r_e = rounded_counts[e].item()
+        old_padded = ((f_e + block_size_M - 1) // block_size_M) * block_size_M if f_e > 0 else 0
+
+        if r_e == 0:
+            read_offset += old_padded
+            continue
+
+        if r_e >= f_e:
+            copy_count = f_e
+        else:
+            token_indices_for_expert = sorted_ids[read_offset:read_offset + f_e].clone()
+            weight_vals = sorted_weights[read_offset:read_offset + f_e].clone()
+            _, keep_indices = weight_vals.topk(r_e, largest=True)
+            keep_indices = keep_indices.sort().values
+
+            new_sorted_ids[write_offset:write_offset + r_e] = token_indices_for_expert[keep_indices]
+            new_sorted_weights[write_offset:write_offset + r_e] = weight_vals[keep_indices]
+
+            num_blocks_e = r_e // block_size_M
+            new_sorted_expert_ids[block_idx:block_idx + num_blocks_e] = e
+            block_idx += num_blocks_e
+            write_offset += r_e
+            read_offset += old_padded
+            continue
+
+        copy_count = f_e
+        new_sorted_ids[write_offset:write_offset + copy_count] = sorted_ids[read_offset:read_offset + copy_count]
+        new_sorted_weights[write_offset:write_offset + copy_count] = sorted_weights[read_offset:read_offset + copy_count]
+
+        num_blocks_e = r_e // block_size_M
+        new_sorted_expert_ids[block_idx:block_idx + num_blocks_e] = e
+        block_idx += num_blocks_e
+        write_offset += r_e
+        read_offset += old_padded
+
+    new_num_valid_ids = torch.tensor([new_total_padded, 0], dtype=torch.int32, device=device)
+
+    return new_sorted_ids, new_sorted_weights, new_sorted_expert_ids, new_num_valid_ids
+
+
 def _moe_sorting_impl(
     topk_ids,
     topk_weights,
@@ -79,6 +181,7 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
     return_local_topk_ids=False,
+    enable_token_rounding=False,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -122,6 +225,7 @@ def _moe_sorting_impl(
             workspace,
             dispatch_policy,
             local_topk_ids,
+            enable_token_rounding,
         )
     else:
         aiter.moe_sorting_fwd(
@@ -156,6 +260,7 @@ def moe_sorting(
     dispatch_policy=0,
     return_local_topk_ids=False,
     flat=False,
+    enable_token_rounding=False,
 ):
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
@@ -175,6 +280,7 @@ def moe_sorting(
             dispatch_policy,
             use_opus=not _USE_CK_MOE_SORTING,
             return_local_topk_ids=return_local_topk_ids,
+            enable_token_rounding=enable_token_rounding,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -228,6 +334,7 @@ def fused_moe(
     splitk=0,
     swiglu_limit=0.0,
     gate_mode: Optional[str] = GateMode.SEPARATED.value,
+    enable_token_rounding=False,
 ):
     if not block_size_M:
         block_size_M = -1
@@ -255,6 +362,7 @@ def fused_moe(
         bias2=bias2,
         swiglu_limit=swiglu_limit,
         gate_mode=gate_mode,
+        enable_token_rounding=enable_token_rounding,
     )
 
 
@@ -320,6 +428,7 @@ def fused_moe_(
     bias2: Optional[torch.Tensor] = None,
     swiglu_limit: float = 0.0,
     gate_mode: str = GateMode.SEPARATED.value,
+    enable_token_rounding: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -420,6 +529,7 @@ def fused_moe_(
         moe_sorting_dispatch_policy,
         return_local_topk_ids=need_local_topk_ids,
         flat=metadata.flat,
+        enable_token_rounding=enable_token_rounding,
     )
     if need_local_topk_ids:
         (
@@ -1269,6 +1379,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
+                use_gather_reduce=_USE_GATHER_REDUCE,
             )
         else:
             stage2_func = functools.partial(
@@ -1310,6 +1421,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
+                use_gather_reduce=_USE_GATHER_REDUCE,
             ),
             get_block_m(),
             ksplit,
@@ -1480,6 +1592,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
+                use_gather_reduce=_USE_GATHER_REDUCE,
             ),
             _cktile_block_m,
             _split_k,
@@ -1515,6 +1628,7 @@ def get_2stage_cfgs(
                 n_pad_zeros=hidden_pad // 64 * 64,
                 k_pad_zeros=intermediate_pad // 128 * 128,
                 activation=activation,
+                use_gather_reduce=_USE_GATHER_REDUCE,
             )
         else:
             stage2_func = functools.partial(
@@ -1552,6 +1666,7 @@ def get_2stage_cfgs(
             n_pad_zeros=hidden_pad // 64 * 64,
             k_pad_zeros=intermediate_pad // 128 * 128,
             activation=activation,
+            use_gather_reduce=_USE_GATHER_REDUCE,
         )
     else:
         stage2_func = functools.partial(
@@ -1832,6 +1947,9 @@ def fused_moe_2stages(
         )
         a2 = a2.view(token_num, topk, inter_dim)
 
+    _gr_kwargs = {}
+    if _USE_GATHER_REDUCE and topk_weights is not None:
+        _gr_kwargs['topk_weights'] = topk_weights
     metadata.stage2(
         a2,
         w1,
@@ -1847,6 +1965,7 @@ def fused_moe_2stages(
         a2_scale=a2_scale,
         block_m=block_size_M,
         sorted_weights=sorted_weights if not doweight_stage1 else None,
+        **_gr_kwargs,
         **extra_stage2_args,
     )
 
@@ -2449,9 +2568,38 @@ def cktile_moe_stage2(
     k_pad_zeros=0,
     bias2=None,
     kernel_name="",
+    use_gather_reduce=False,
+    topk_weights=None,
 ):
     bias2 = _normalize_bias_for_kernel(bias2)
-    # print("Run cktile_moe_stage2: M=%d, N=%d, K=%d, topk=%d, expert=%d"%(a2.shape[0]*a2.shape[1], w2.shape[1], a2.shape[2], topk, w2.shape[0]))
+    if use_gather_reduce:
+        T = out.shape[0]
+        H = w2.shape[1]
+        y_buf = torch.empty(T, topk, H, dtype=out.dtype, device=out.device)
+        aiter.moe_cktile2stages_gemm2(
+            a2,
+            w2,
+            y_buf.view(T * topk, H),
+            sorted_token_ids,
+            sorted_expert_ids,
+            num_valid_ids,
+            topk,
+            n_pad_zeros,
+            k_pad_zeros,
+            None,
+            a2_scale,
+            w2_scale,
+            bias2,
+            activation,
+            block_m,
+            kernel_name=kernel_name,
+            use_gather_reduce=True,
+        )
+        if topk_weights is not None:
+            y_buf *= topk_weights.view(T, topk, 1).to(y_buf.dtype)
+        out.copy_(y_buf.sum(dim=1))
+        return out
+
     aiter.moe_cktile2stages_gemm2(
         a2,
         w2,

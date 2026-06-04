@@ -104,4 +104,5 @@ cktile_moe_gemm2(torch::Tensor& XQ,
                  std::optional<int> activation,
                  std::optional<int> block_m,
                  std::optional<int> split_k,
-                 std::string kernel_name = "");
+                 std::string kernel_name = "",
+                 bool use_gather_reduce = false);

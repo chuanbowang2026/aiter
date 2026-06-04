@@ -24,7 +24,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> num_local_tokens,
                           std::optional<aiter_tensor_t> workspace,
                           int dispatch_policy,
-                          std::optional<aiter_tensor_t> local_topk_ids)
+                          std::optional<aiter_tensor_t> local_topk_ids,
+                          bool enable_token_rounding)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be FP32 (float32)");
@@ -75,6 +76,7 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
          num_experts,
          topk,
          static_cast<int>(moe_buf.size(-1)),
-         static_cast<int>(moe_buf.element_size())},
+         static_cast<int>(moe_buf.element_size()),
+         enable_token_rounding},
         {stream});
 }

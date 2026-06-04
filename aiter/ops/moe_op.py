@@ -422,6 +422,7 @@ def moe_cktile2stages_gemm2_ck(
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
     kernel_name: str = "",
+    use_gather_reduce: bool = False,
 ) -> Tensor: ...
 
 
@@ -443,6 +444,7 @@ def moe_cktile2stages_gemm2(
     block_m: Optional[int] = 32,
     split_k: Optional[int] = 1,
     kernel_name: str = "",
+    use_gather_reduce: bool = False,
 ):
     return moe_cktile2stages_gemm2_ck(
         XQ,
@@ -462,6 +464,7 @@ def moe_cktile2stages_gemm2(
         block_m,
         split_k,
         kernel_name,
+        use_gather_reduce,
     )
 
 

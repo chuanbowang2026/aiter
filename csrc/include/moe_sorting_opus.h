@@ -24,7 +24,8 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
                           std::optional<aiter_tensor_t> num_local_tokens  = std::nullopt,
                           std::optional<aiter_tensor_t> workspace        = std::nullopt,
                           int dispatch_policy                             = 0,
-                          std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt);
+                          std::optional<aiter_tensor_t> local_topk_ids   = std::nullopt,
+                          bool enable_token_rounding                      = false);
 
 #ifdef MOE_SORTING_OPUS_IMPL
 // ============================================================================
@@ -441,6 +442,7 @@ struct MoeSortingHostArgs
     // Besides, we require inter_dim to be multiple of 16 byte(make sure when alloc ws for fmoe)
     opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
     opus::index_t moe_buf_elem_bytes; // p_moe_buf byte size(8bit, 16bit, 32bit, etc.)
+    bool enable_token_rounding;       // nearest-round instead of ceil-pad (SonicMoE Algorithm 4)
 
 };
 
@@ -480,6 +482,7 @@ struct MoeSortingKernel
         opus::mdiv unit_size_mdiv;
         opus::mdiv topk_mdiv;
         opus::mdiv expert_mdiv;
+        bool enable_token_rounding; // nearest-round instead of ceil-pad
         // opus::mdiv sub_tokens_mdiv;
     };
 
@@ -538,7 +541,8 @@ struct MoeSortingKernel
         k.topk_mdiv         = opus::mdiv{static_cast<uint32_t>(h.topk)};
         // NOTE: tokens could from p_local_tokens, so here the LDS will be bigger than expected (but works)
         k.smem_rows         = opus::get<0>(moe_sorting_get_smem_row_col(h.tokens, h.num_experts));
-        k.expert_mdiv      = opus::mdiv{static_cast<uint32_t>(h.num_experts)};
+        k.expert_mdiv              = opus::mdiv{static_cast<uint32_t>(h.num_experts)};
+        k.enable_token_rounding    = h.enable_token_rounding;
         // k.sub_tokens_mdiv  = opus::mdiv{static_cast<uint32_t>(k.smem_rows - 1)};
         return k;
     }
@@ -743,7 +747,8 @@ struct MoeSortingKernel
                                                const opus::mdiv topk_mdiv,
                                                const opus::mdiv expert_mdiv,
                                                const opus::index_t smem_rows,
-                                               void* smem) const
+                                               void* smem,
+                                               const bool enable_token_rounding = false) const
     {
         const opus::index_t tid = static_cast<opus::index_t>(threadIdx.x);
         const opus::index_t wid = __builtin_amdgcn_readfirstlane(tid / opus::get_warp_size());
@@ -859,8 +864,16 @@ struct MoeSortingKernel
                 {
                     int pre_cumsum_ = smem_cumsum(lid == 0 ? i_e_ : 0);
                     int local_cnt   = smem_cumsum(i_e_ + lid + 1);
-                    int blocks_pers_expert =
-                        unit_size_mdiv.div(local_cnt + unit_size_mdiv.divisor - 1);
+                    int M_              = unit_size_mdiv.divisor;
+                    int ceil_blocks     = unit_size_mdiv.div(local_cnt + M_ - 1);
+                    int blocks_pers_expert = ceil_blocks;
+                    if(enable_token_rounding && local_cnt > 0)
+                    {
+                        int floor_blocks = unit_size_mdiv.div(local_cnt);
+                        if(floor_blocks > 0 &&
+                           (local_cnt - M_ * floor_blocks) < (M_ * ceil_blocks - local_cnt))
+                            blocks_pers_expert = floor_blocks;
+                    }
 
                     int pre_cumsum_masking = [&]() {
                         if constexpr(Problem::LocalExpertMasking)
@@ -1122,7 +1135,8 @@ struct MoeSortingKernel
             kargs.topk_mdiv,
             kargs.expert_mdiv,
             kargs.smem_rows,
-            smem);
+            smem,
+            kargs.enable_token_rounding);
     }
 };
 
@@ -2262,6 +2276,7 @@ struct MoeSortingMultiPhaseKernel_P2
         opus::mdiv unit_size_mdiv;
         opus::index_t moe_buf_interm_dim;
         opus::index_t moe_buf_elem_bytes;
+        bool enable_token_rounding;
     };
 
     OPUS_H static constexpr auto MakeKargs(const Hargs& h)
@@ -2277,13 +2292,13 @@ struct MoeSortingMultiPhaseKernel_P2
 
         k.p_moe_buf = h.p_moe_buf;
 
-        k.tokens         = h.tokens;
-        k.num_experts    = h.num_experts;
-        k.mesh_stride    = impl::moe_sorting_mp_mesh_stride(h.tokens);
-        k.unit_size_mdiv = opus::mdiv{static_cast<uint32_t>(h.unit_size)};
-
-        k.moe_buf_interm_dim = h.moe_buf_interm_dim;
-        k.moe_buf_elem_bytes = h.moe_buf_elem_bytes;
+        k.tokens                = h.tokens;
+        k.num_experts           = h.num_experts;
+        k.mesh_stride           = impl::moe_sorting_mp_mesh_stride(h.tokens);
+        k.unit_size_mdiv        = opus::mdiv{static_cast<uint32_t>(h.unit_size)};
+        k.moe_buf_interm_dim    = h.moe_buf_interm_dim;
+        k.moe_buf_elem_bytes    = h.moe_buf_elem_bytes;
+        k.enable_token_rounding = h.enable_token_rounding;
 
         return k;
     }
@@ -2355,8 +2370,16 @@ struct MoeSortingMultiPhaseKernel_P2
                     b_ = p_local_expert_mask[position];
             }
 
-            int blocks_pers_expert =
-                kargs.unit_size_mdiv.div(a_ + kargs.unit_size_mdiv.divisor - 1);
+            int M_p2              = kargs.unit_size_mdiv.divisor;
+            int ceil_blocks_p2    = kargs.unit_size_mdiv.div(a_ + M_p2 - 1);
+            int blocks_pers_expert = ceil_blocks_p2;
+            if(kargs.enable_token_rounding && a_ > 0)
+            {
+                int floor_blocks_p2 = kargs.unit_size_mdiv.div(a_);
+                if(floor_blocks_p2 > 0 &&
+                   (a_ - M_p2 * floor_blocks_p2) < (M_p2 * ceil_blocks_p2 - a_))
+                    blocks_pers_expert = floor_blocks_p2;
+            }
             // pad token
             int padded_blocks_per_expert = [&]() {
                 int x_ = [&]() {
@@ -2679,6 +2702,7 @@ struct MoeSortingMultiPhaseKernel_P23
         // Besides, we require inter_dim to be multiple of 16 byte(make sure when alloc ws for fmoe)
         opus::index_t moe_buf_interm_dim; // p_moe_buf interm_dim
         opus::index_t moe_buf_elem_bytes; // p_moe_buf byte size(8bit, 16bit, 32bit, etc.)
+        bool enable_token_rounding;
     };
 
     OPUS_H static constexpr auto MakeKargs(const Hargs& h)
@@ -2701,14 +2725,14 @@ struct MoeSortingMultiPhaseKernel_P23
         k.p_moe_buf        = h.p_moe_buf;
         k.p_local_topk_ids = h.p_local_topk_ids;
 
-        k.tokens         = h.tokens;
-        k.num_experts    = h.num_experts;
-        k.mesh_stride    = impl::moe_sorting_mp_mesh_stride(h.tokens);
-        k.unit_size_mdiv = opus::mdiv{static_cast<uint32_t>(h.unit_size)};
-        k.topk_mdiv      = opus::mdiv{static_cast<uint32_t>(h.topk)};
-
-        k.moe_buf_interm_dim = h.moe_buf_interm_dim;
-        k.moe_buf_elem_bytes = h.moe_buf_elem_bytes;
+        k.tokens                = h.tokens;
+        k.num_experts           = h.num_experts;
+        k.mesh_stride           = impl::moe_sorting_mp_mesh_stride(h.tokens);
+        k.unit_size_mdiv        = opus::mdiv{static_cast<uint32_t>(h.unit_size)};
+        k.topk_mdiv             = opus::mdiv{static_cast<uint32_t>(h.topk)};
+        k.moe_buf_interm_dim    = h.moe_buf_interm_dim;
+        k.moe_buf_elem_bytes    = h.moe_buf_elem_bytes;
+        k.enable_token_rounding = h.enable_token_rounding;
 
         return k;
     }
@@ -2801,8 +2825,16 @@ struct MoeSortingMultiPhaseKernel_P23
                         b_ = p_local_expert_mask[position];
                 }
 
-                int blocks_pers_expert =
-                    kargs.unit_size_mdiv.div(a_ + kargs.unit_size_mdiv.divisor - 1);
+                int M_p23              = kargs.unit_size_mdiv.divisor;
+                int ceil_blocks_p23    = kargs.unit_size_mdiv.div(a_ + M_p23 - 1);
+                int blocks_pers_expert = ceil_blocks_p23;
+                if(kargs.enable_token_rounding && a_ > 0)
+                {
+                    int floor_blocks_p23 = kargs.unit_size_mdiv.div(a_);
+                    if(floor_blocks_p23 > 0 &&
+                       (a_ - M_p23 * floor_blocks_p23) < (M_p23 * ceil_blocks_p23 - a_))
+                        blocks_pers_expert = floor_blocks_p23;
+                }
                 // pad token
                 int padded_blocks_per_expert = [&]() {
                     int x_ = [&]() {

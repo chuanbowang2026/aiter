@@ -235,6 +235,20 @@ namespace py = pybind11;
           "                str kv_cache_dtype,"                   \
           "                float k_scale, float v_scale) -> ()");
 
+#define ATTENTION_V1_PYBIND                                       \
+    m.def("paged_attention_v1",                                   \
+          &paged_attention_v1,                                    \
+          "paged_attention_v1(Tensor! out, Tensor exp_sums,"      \
+          "                Tensor max_logits, Tensor tmp_out,"    \
+          "                Tensor query, Tensor key_cache,"       \
+          "                Tensor value_cache, int num_kv_heads," \
+          "                float scale, Tensor block_tables,"     \
+          "                Tensor context_lens, int block_size,"  \
+          "                int max_context_len,"                  \
+          "                Tensor? alibi_slopes,"                 \
+          "                str kv_cache_dtype,"                   \
+          "                float k_scale, float v_scale) -> ()");
+
 #define BATCHED_GEMM_A8W8_PYBIND            \
     m.def("batched_gemm_a8w8",              \
           &batched_gemm_a8w8,               \
@@ -302,14 +316,6 @@ namespace py = pybind11;
           py::arg("bias") = std::nullopt,         \
           py::arg("kernelId") = 0,                \
           py::arg("splitK")   = 0);
-
-#define OPUS_GEMM_WORKSPACE_INIT_PYBIND                                 \
-    m.def("opus_gemm_workspace_init",                                   \
-          &opus_gemm_workspace_init,                                    \
-          "Register a splitk fp32 workspace handle for the current "    \
-          "CUDA stream. Call once per stream eagerly (outside HIP "     \
-          "graph capture) before capturing graphs that include "        \
-          "opus_gemm splitk kernels under TBO.");
 
 #define CACHE_PYBIND                                                                \
     m.def("swap_blocks",                                                            \
@@ -1155,7 +1161,8 @@ namespace py = pybind11;
           py::arg("activation")     = 0,                \
           py::arg("block_m")        = 32,               \
           py::arg("split_k")        = 1,                \
-          py::arg("kernel_name")    = std::string(""));
+          py::arg("kernel_name")    = std::string(""), \
+          py::arg("use_gather_reduce") = false);
 
 #define MHA_VARLEN_FWD_PYBIND                            \
     m.def("mha_varlen_fwd",                              \
@@ -1330,8 +1337,9 @@ namespace py = pybind11;
           py::arg("local_expert_mask") = std::nullopt, \
           py::arg("num_local_tokens")  = std::nullopt, \
           py::arg("workspace")         = std::nullopt, \
-          py::arg("dispatch_policy")   = 0,            \
-          py::arg("local_topk_ids")    = std::nullopt);
+          py::arg("dispatch_policy")        = 0,            \
+          py::arg("local_topk_ids")         = std::nullopt, \
+          py::arg("enable_token_rounding")  = false);
 
 #define PA_SPARSE_PREFILL_OPUS_PYBIND                  \
     m.def("pa_sparse_prefill_opus_fwd",        \

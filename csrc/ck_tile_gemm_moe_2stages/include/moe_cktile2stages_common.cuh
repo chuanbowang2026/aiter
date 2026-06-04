@@ -89,6 +89,7 @@ template <typename FlatmmConfig,
           ck_tile::MoeFlatmmKind moe_kind,
           typename CDEElementWise,
           int ActivationOp,
+          bool ForceSetOutput_ = false,
           typename MoeFlatmmHostArgs>
 void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
 {
@@ -241,7 +242,8 @@ void moe_gemm(const MoeFlatmmHostArgs& args, const ck_stream_config& s)
                                                 CodegenFlatmmPipeline,
                                                 GemmEpilogue,
                                                 moe_kind,
-                                                FusedAct>;
+                                                FusedAct,
+                                                ForceSetOutput_>;
 
         auto kargs = Kernel::MakeKernelArgs(args);
 
